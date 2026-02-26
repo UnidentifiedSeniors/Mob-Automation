@@ -1,14 +1,18 @@
 name: Build & Release Windows EXE
 
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -24,12 +28,16 @@ jobs:
         run: pip install pyinstaller
 
       - name: Build EXE
-        run: |
-          pyinstaller --onefile --windowed --name GameBot --collect-all PyQt6 --add-data "*.png;." --icon=icon.ico ui_pyqt6_windows.py
+        run: pyinstaller --onefile --windowed --name GameBot --collect-all PyQt6 --add-data "*.png;." --icon=icon.ico ui_pyqt6_windows.py
 
-      - name: Upload artifact to release
+      - name: Show dist contents (debug)
+        shell: powershell
+        run: Get-ChildItem -Path dist -Recurse
+
+      - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
         with:
           files: dist/GameBot.exe
+          overwrite_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
