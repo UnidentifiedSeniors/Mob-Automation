@@ -27,10 +27,15 @@ jobs:
         run: pip install pyinstaller
 
       - name: Build EXE
-        run: pyinstaller --onefile --windowed --add-data "*.png;." GameBot_windows.py
+        run: |
+          pyinstaller --onefile --windowed --name GameBot --collect-all PyQt6 --add-data "*.png;." --icon=icon.ico ui_pyqt6_windows.py
+
+      - name: Show dist contents (debug)
+        shell: powershell
+        run: Get-ChildItem -Path dist -Recurse
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: GameBot-Windows
-          path: dist/GameBot_windows.exe
+          path: dist/*.exe
