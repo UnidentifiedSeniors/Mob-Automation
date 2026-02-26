@@ -1,18 +1,14 @@
 name: Build & Release Windows EXE
 
 on:
-  push:
-    tags:
-      - "v*"
-  workflow_dispatch:
+  release:
+    types: [published]
 
 jobs:
   build:
     runs-on: windows-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -31,7 +27,7 @@ jobs:
         run: |
           pyinstaller --onefile --windowed --name GameBot --collect-all PyQt6 --add-data "*.png;." --icon=icon.ico ui_pyqt6_windows.py
 
-      - name: Create Release
+      - name: Upload artifact to release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/GameBot.exe
