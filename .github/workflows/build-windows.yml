@@ -2,9 +2,11 @@ name: Build & Release Windows EXE
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - "v*"
+    inputs:
+      release_tag:
+        description: 'Tag to attach the release to'
+        required: true
+        default: v1.0.1
 
 jobs:
   build:
@@ -37,6 +39,7 @@ jobs:
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.release_tag }}
           files: dist/GameBot.exe
           overwrite_files: true
         env:
