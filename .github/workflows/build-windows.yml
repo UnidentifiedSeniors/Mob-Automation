@@ -29,18 +29,27 @@ jobs:
       - name: Install PyInstaller
         run: pip install pyinstaller
 
-      - name: Build EXE
-        run: pyinstaller --onefile --windowed --name GameBot --collect-all PyQt6 --add-data "*.png;." --icon=icon.ico ui_pyqt6_windows.py
+      - name: Build App (onedir)
+        run: pyinstaller --noconfirm --clean --windowed --name GameBot --collect-all PyQt6 --add-data "*.png;." --icon=icon.ico ui_pyqt6_windows.py
 
       - name: Show dist contents (debug)
         shell: powershell
         run: Get-ChildItem -Path dist -Recurse
 
+      - name: Package onedir build
+        shell: powershell
+        run: |
+          $zipPath = "GameBot-windows-onedir.zip"
+          if (Test-Path $zipPath) {
+            Remove-Item $zipPath -Force
+          }
+          Compress-Archive -Path "dist/GameBot/*" -DestinationPath $zipPath -Force
+
       - name: Generate SHA256 checksum
         shell: powershell
         run: |
-          $hash = (Get-FileHash -Path dist/GameBot.exe -Algorithm SHA256).Hash.ToLower()
-          "$hash  GameBot.exe" | Out-File -FilePath SHA256SUMS.txt -Encoding ascii
+          $hash = (Get-FileHash -Path GameBot-windows-onedir.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  GameBot-windows-onedir.zip" | Out-File -FilePath SHA256SUMS.txt -Encoding ascii
           Get-Content SHA256SUMS.txt
 
       - name: Create Release
@@ -61,9 +70,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: dist/GameBot.exe
-          asset_name: GameBot.exe
-          asset_content_type: application/octet-stream
+          asset_path: GameBot-windows-onedir.zip
+          asset_name: GameBot-windows-onedir.zip
+          asset_content_type: application/zip
 
       - name: Upload SHA256 checksum asset
         id: upload_checksum_asset
