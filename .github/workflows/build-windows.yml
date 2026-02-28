@@ -36,6 +36,13 @@ jobs:
         shell: powershell
         run: Get-ChildItem -Path dist -Recurse
 
+      - name: Generate SHA256 checksum
+        shell: powershell
+        run: |
+          $hash = (Get-FileHash -Path dist/GameBot.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  GameBot.exe" | Out-File -FilePath SHA256SUMS.txt -Encoding ascii
+          Get-Content SHA256SUMS.txt
+
       - name: Create Release
         id: create_release
         uses: actions/create-release@v1
@@ -57,3 +64,14 @@ jobs:
           asset_path: dist/GameBot.exe
           asset_name: GameBot.exe
           asset_content_type: application/octet-stream
+
+      - name: Upload SHA256 checksum asset
+        id: upload_checksum_asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: SHA256SUMS.txt
+          asset_name: SHA256SUMS.txt
+          asset_content_type: text/plain
