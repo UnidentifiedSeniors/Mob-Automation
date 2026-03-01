@@ -75,7 +75,12 @@ class GameBot:
         self._click_point_cache: dict[str, tuple[int, int]] = {}
         self._ashgor_body_missing_warned = False
         self._resource_dir = _resource_base_dir()
-        self._roblox_window_titles = ("Roblox", "Roblox Player", "RobloxPlayerBeta")
+        self._roblox_window_titles = (
+            "Roblox Player",
+            "RobloxPlayerBeta",
+            "Roblox",
+            "Bloxstrap",
+        )
         self._chrome_window_titles = ("Google Chrome", "Chrome", "Google")
         self._saved_pyautogui_pause: Optional[float] = None
         self._saved_pyautogui_minimum_sleep: Optional[float] = None
@@ -262,9 +267,69 @@ class GameBot:
             self._emit_log(f"Failed to move mouse to center for alignment: {exc}")
             return False
 
-    def _find_first_window(self, candidate_titles: tuple[str, ...]):
+    def _find_first_window(
+        self,
+        candidate_titles: tuple[str, ...],
+        exclude_titles: tuple[str, ...] = (),
+    ):
         if gw is None:
             return None
+        include_tokens = [t.strip().lower() for t in candidate_titles if isinstance(t, str) and t.strip()]
+        exclude_tokens = [t.strip().lower() for t in exclude_titles if isinstance(t, str) and t.strip()]
+        if not include_tokens:
+            return None
+
+        def _window_score(win_obj, title_lower: str) -> int:
+            try:
+                width = max(0, int(getattr(win_obj, "width", 0)))
+                height = max(0, int(getattr(win_obj, "height", 0)))
+                area = width * height
+            except Exception:
+                area = 0
+            try:
+                minimized = bool(getattr(win_obj, "isMinimized", False))
+            except Exception:
+                minimized = False
+
+            score = area
+            if not minimized:
+                score += 10_000_000
+            if any(title_lower == token for token in include_tokens):
+                score += 20_000_000
+            if any(title_lower.startswith(token) for token in include_tokens):
+                score += 5_000_000
+            return score
+
+        best_win = None
+        best_score = -1
+        try:
+            all_windows = gw.getAllWindows()
+        except Exception:
+            all_windows = []
+
+        for win in all_windows:
+            try:
+                raw_title = getattr(win, "title", "")
+            except Exception:
+                raw_title = ""
+            title = raw_title.strip() if isinstance(raw_title, str) else ""
+            if not title:
+                continue
+            title_lower = title.lower()
+            if not any(token in title_lower for token in include_tokens):
+                continue
+            if any(token in title_lower for token in exclude_tokens):
+                continue
+
+            score = _window_score(win, title_lower)
+            if score > best_score:
+                best_score = score
+                best_win = win
+
+        if best_win is not None:
+            return best_win
+
+        # Fallback for environments where getAllWindows can be stale.
         for title in candidate_titles:
             try:
                 windows = gw.getWindowsWithTitle(title)
@@ -277,7 +342,10 @@ class GameBot:
                     win_title = getattr(win, "title", "")
                 except Exception:
                     win_title = ""
-                if isinstance(win_title, str) and not win_title.strip():
+                if not isinstance(win_title, str) or not win_title.strip():
+                    continue
+                win_title_lower = win_title.strip().lower()
+                if any(token in win_title_lower for token in exclude_tokens):
                     continue
                 return win
         return None
@@ -287,7 +355,10 @@ class GameBot:
             self._emit_log("Cannot focus Roblox window: pygetwindow is not available.")
             return False
 
-        win = self._find_first_window(self._roblox_window_titles)
+        win = self._find_first_window(
+            self._roblox_window_titles,
+            exclude_titles=self._chrome_window_titles,
+        )
         if win is None:
             self._emit_log("Roblox window not found.")
             return False
@@ -554,7 +625,18 @@ class GameBot:
     def _get_roblox_region(self):
         if gw is None:
             return None
-        win = self._find_first_window(self._roblox_window_titles)
+        win = self._find_first_window(
+            self._roblox_window_titles,
+            exclude_titles=self._chrome_window_titles,
+        )
+        if win is None:
+            return None
+        return self._window_to_region(win)
+
+    def _get_google_region(self):
+        if gw is None:
+            return None
+        win = self._find_first_window(self._chrome_window_titles)
         if win is None:
             return None
         return self._window_to_region(win)
@@ -563,7 +645,10 @@ class GameBot:
         # Keep play detection scoped to Roblox window on Windows when available.
         if gw is None:
             return None
-        win = self._find_first_window(self._roblox_window_titles)
+        win = self._find_first_window(
+            self._roblox_window_titles,
+            exclude_titles=self._chrome_window_titles,
+        )
         if win is None:
             return None
         return self._window_to_region(win)
@@ -1104,37 +1189,38 @@ class GameBot:
             self._emit_log(f"Template not found: {template_path}")
             return False
 
-        region = self._get_play_style_region()
+        search_targets: list[tuple[str, Optional[tuple[int, int, int, int]]]] = []
+        roblox_region = self._get_roblox_region()
+        if roblox_region is not None:
+            search_targets.append(("Roblox window", roblox_region))
+        google_region = self._get_google_region()
+        if google_region is not None and google_region != roblox_region:
+            search_targets.append(("Google Chrome window", google_region))
+        search_targets.append(("full screen", None))
 
-        self._emit_log(
-            f"Looking for {template_path.name}..."
-            + (f" (region={region})" if region else " (full screen)")
-        )
-        try:
-            # confidence requires OpenCV; if unavailable, fallback to default match.
-            try:
-                point = pyautogui.locateCenterOnScreen(
-                    str(template_path), confidence=0.9, grayscale=True, region=region
-                )
-            except Exception as exc:
-                if self._is_not_found_exc(exc):
-                    point = None
-                else:
-                    point = pyautogui.locateCenterOnScreen(str(template_path), region=region)
-        except Exception as exc:
-            if self._is_not_found_exc(exc):
-                point = None
-            else:
-                self._emit_log(
-                    f"Image detection error for play button: {exc.__class__.__name__}: {exc!r}"
-                )
-                return False
+        coords = None
+        for label, region in search_targets:
+            self._emit_log(
+                f"Looking for play_button.png in {label}..."
+                + (f" (region={region})" if region else "")
+            )
+            coords = self._locate_image_center(
+                "play_button.png",
+                confidence=0.9,
+                region=region,
+                retries=2,
+                retry_delay=0.25,
+                emit_log=False,
+                grayscale_first=True,
+            )
+            if coords is not None:
+                break
 
-        if point is None:
+        if coords is None:
             self._emit_log("play_button.png not found on screen.")
             return False
 
-        click_x, click_y = self._resolve_screen_point(point)
+        click_x, click_y = coords
 
         try:
             pyautogui.click(click_x, click_y)
@@ -1190,22 +1276,41 @@ class GameBot:
             else:
                 self._emit_log("Load timeout reshuffle disabled: waiting indefinitely for player load.")
 
-            self._emit_log("Searching for Roblox window...")
-            if not self._focus_roblox_window():
-                finish_reason = "Roblox window not found/focus failed"
-                self._emit_status("Error", "#FF6B6B")
-                return
+            self._emit_log("Preparing focus before Play click...")
+            roblox_focused = self._focus_roblox_window()
+            if roblox_focused:
+                self._emit_log("Roblox focused.")
+            else:
+                self._emit_log(
+                    "Roblox window not found yet. Trying Google Chrome focus for web Play flow..."
+                )
+                if self._focus_google_window():
+                    self._emit_log("Google Chrome focused.")
+                else:
+                    self._emit_log(
+                        "Could not focus Roblox/Chrome. Continuing with full-screen Play scan."
+                    )
 
-            self._emit_log("Roblox focused. Waiting 0.5 second before clicking Play...")
+            self._emit_log("Waiting 0.5 second before clicking Play...")
             if not self._sleep_interruptible(0.5):
                 finish_reason = self._interrupt_reason()
                 success = True
                 return
 
             if not self._find_and_click_play_button():
-                finish_reason = "Play button not found/click failed"
-                self._emit_status("Error", "#FF6B6B")
-                return
+                self._emit_log(
+                    "Play button not found on first attempt. Refocusing and retrying once..."
+                )
+                if not self._focus_google_window():
+                    self._focus_roblox_window()
+                if not self._sleep_interruptible(0.35):
+                    finish_reason = self._interrupt_reason()
+                    success = True
+                    return
+                if not self._find_and_click_play_button():
+                    finish_reason = "Play button not found/click failed"
+                    self._emit_status("Error", "#FF6B6B")
+                    return
 
             self._emit_status("Loading...", "#FFD166")
             load_state, gate_image, gate_coords = self._wait_for_player_load_after_play()
