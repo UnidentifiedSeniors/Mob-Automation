@@ -18,6 +18,16 @@ except Exception:  # pragma: no cover
     Image = None
 
 try:
+    import cv2
+except Exception:  # pragma: no cover
+    cv2 = None
+
+try:
+    import numpy as np
+except Exception:  # pragma: no cover
+    np = None
+
+try:
     import pygetwindow as gw
 except Exception:  # pragma: no cover
     gw = None
@@ -807,6 +817,127 @@ class GameBot:
             except Exception as exc:
                 self._emit_log(f"Failed debug hover at ({cx}, {cy}): {exc}")
 
+    def _locate_blue_play_button_center(self, region):
+        # Last-resort heuristic for Roblox Play: a wide saturated blue button with small white content.
+        if pyautogui is None or cv2 is None or np is None:
+            return None
+
+        search_region = region
+        if search_region is None:
+            try:
+                sw, sh = pyautogui.size()
+                search_region = (0, 0, sw, sh)
+            except Exception:
+                return None
+
+        rx, ry, rw, rh = search_region
+        if rw <= 0 or rh <= 0:
+            return None
+
+        try:
+            haystack = pyautogui.screenshot(region=search_region)
+        except Exception:
+            return None
+
+        hay_w, hay_h = haystack.size
+        if hay_w <= 0 or hay_h <= 0:
+            return None
+        scale_x = hay_w / max(rw, 1)
+        scale_y = hay_h / max(rh, 1)
+
+        try:
+            frame_rgb = np.array(haystack.convert("RGB"))
+        except Exception:
+            return None
+        if frame_rgb.size == 0:
+            return None
+
+        try:
+            frame_hsv = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
+            blue_mask = cv2.inRange(frame_hsv, (90, 70, 70), (135, 255, 255))
+            kernel = np.ones((5, 5), dtype=np.uint8)
+            blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+            blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+            contour_data = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        except Exception:
+            return None
+
+        contours = contour_data[0] if len(contour_data) == 2 else contour_data[1]
+        if not contours:
+            return None
+
+        best: Optional[tuple[float, float, float, int, int, float, float]] = None
+        center_x_hay = hay_w / 2.0
+        center_y_hay = hay_h / 2.0
+
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < 1700.0:
+                continue
+
+            x, y, w, h = cv2.boundingRect(contour)
+            if w < 80 or h < 24 or h > 180:
+                continue
+
+            ratio = w / max(float(h), 1.0)
+            if ratio < 2.0 or ratio > 10.0:
+                continue
+
+            fill_ratio = area / max(float(w * h), 1.0)
+            if fill_ratio < 0.45:
+                continue
+
+            roi = frame_rgb[y : y + h, x : x + w]
+            if roi.size == 0:
+                continue
+            white_ratio = float(
+                ((roi[:, :, 0] > 185) & (roi[:, :, 1] > 185) & (roi[:, :, 2] > 185)).mean()
+            )
+            if white_ratio < 0.01 or white_ratio > 0.60:
+                continue
+
+            cx = float(x) + (float(w) / 2.0)
+            cy = float(y) + (float(h) / 2.0)
+            center_distance = abs(cx - center_x_hay) + abs(cy - center_y_hay)
+            score = area - (center_distance * 1.8)
+
+            if best is None or score > best[0]:
+                best = (score, cx, cy, w, h, white_ratio, area)
+
+        if best is None:
+            return None
+
+        _, cx, cy, w, h, white_ratio, area = best
+        center_region_x = int(cx / max(scale_x, 1e-9))
+        center_region_y = int(cy / max(scale_y, 1e-9))
+        click_x = rx + center_region_x
+        click_y = ry + center_region_y
+        self._emit_log(
+            "Blue-play fallback candidate: "
+            f"pos=({click_x}, {click_y}), size={w}x{h}, area={area:.0f}, white_ratio={white_ratio:.3f}."
+        )
+        return click_x, click_y
+
+    def _click_play_button_at(self, click_x: int, click_y: int, source: str) -> bool:
+        click_x = int(click_x)
+        click_y = int(click_y)
+        if self.settings.dry_run:
+            self._click_point_cache["play_button.png"] = (click_x, click_y)
+            self._emit_log(
+                f"Dry-run: would click play button at ({click_x}, {click_y}) using {source}."
+            )
+            return True
+
+        try:
+            pyautogui.click(click_x, click_y)
+            self._click_point_cache["play_button.png"] = (click_x, click_y)
+            self._emit_log(f"Cached click position for play_button.png at ({click_x}, {click_y}).")
+            self._emit_log(f"Clicked play button at ({click_x}, {click_y}) using {source}.")
+            return True
+        except Exception as exc:
+            self._emit_log(f"Failed to click play button at ({click_x}, {click_y}) via {source}: {exc}")
+            return False
+
     def _locate_image_center(
         self,
         image_name: str,
@@ -1176,61 +1307,90 @@ class GameBot:
         cached_play = self._click_point_cache.get("play_button.png")
         if cached_play is not None:
             cached_x, cached_y = cached_play
-            try:
-                pyautogui.click(cached_x, cached_y)
-                self._emit_log(f"Clicked play button at cached position ({cached_x}, {cached_y}).")
+            if self._click_play_button_at(cached_x, cached_y, "cached position"):
                 return True
-            except Exception as exc:
-                self._emit_log(f"Cached play click failed; re-locating template: {exc}")
-                self._click_point_cache.pop("play_button.png", None)
+            self._emit_log("Cached play click failed; re-locating template.")
+            self._click_point_cache.pop("play_button.png", None)
 
         template_path = self._resource_dir / "play_button.png"
         if not template_path.exists():
             self._emit_log(f"Template not found: {template_path}")
             return False
 
-        search_targets: list[tuple[str, Optional[tuple[int, int, int, int]]]] = []
-        roblox_region = self._get_roblox_region()
-        if roblox_region is not None:
-            search_targets.append(("Roblox window", roblox_region))
-        google_region = self._get_google_region()
-        if google_region is not None and google_region != roblox_region:
-            search_targets.append(("Google Chrome window", google_region))
-        search_targets.append(("full screen", None))
+        base_region = self._get_play_style_region()
+        timeout_seconds = 12.0
+        confidence_steps = [0.92, 0.9, 0.88, 0.85, 0.82, 0.78]
+        scale_steps = [1.0, 0.95, 1.05, 0.9, 1.1, 0.85, 1.15, 0.8, 1.25, 0.75, 1.35]
 
-        coords = None
-        for label, region in search_targets:
-            self._emit_log(
-                f"Looking for play_button.png in {label}..."
-                + (f" (region={region})" if region else "")
-            )
-            coords = self._locate_image_center(
-                "play_button.png",
-                confidence=0.9,
-                region=region,
-                retries=2,
-                retry_delay=0.25,
-                emit_log=False,
-                grayscale_first=True,
-            )
-            if coords is not None:
+        self._emit_log(
+            f"Looking for {template_path.name} with robust scan (up to {timeout_seconds:.1f}s)..."
+            + (f" (region={base_region})" if base_region else " (full screen)")
+        )
+
+        started_at = time.perf_counter()
+        attempt = 0
+        while not self._stop_event.is_set():
+            elapsed = time.perf_counter() - started_at
+            if elapsed > timeout_seconds:
                 break
 
-        if coords is None:
-            self._emit_log("play_button.png not found on screen.")
-            return False
+            attempt += 1
+            search_regions = [base_region]
+            if base_region is not None and attempt >= 3:
+                search_regions.append(None)
 
-        click_x, click_y = coords
+            for region in search_regions:
+                region_label = f"region={region}" if region is not None else "full screen"
 
-        try:
-            pyautogui.click(click_x, click_y)
-            self._click_point_cache["play_button.png"] = (click_x, click_y)
-            self._emit_log(f"Cached click position for play_button.png at ({click_x}, {click_y}).")
-            self._emit_log(f"Clicked play button at ({click_x}, {click_y}).")
-            return True
-        except Exception as exc:
-            self._emit_log(f"Failed to click play button: {exc}")
-            return False
+                for grayscale_first in (True, False):
+                    for conf in confidence_steps:
+                        coords = self._locate_image_center(
+                            "play_button.png",
+                            confidence=conf,
+                            region=region,
+                            retries=1,
+                            retry_delay=0.0,
+                            emit_log=False,
+                            grayscale_first=grayscale_first,
+                        )
+                        if coords is None:
+                            continue
+                        click_x, click_y = coords
+                        self._emit_log(
+                            "play_button.png matched via direct template scan "
+                            f"(confidence={conf:.2f}, grayscale_first={grayscale_first}, {region_label})."
+                        )
+                        if self._click_play_button_at(click_x, click_y, "direct template scan"):
+                            return True
+
+                scaled_coords = self._locate_image_center_in_region_scaled(
+                    template_path,
+                    region=region,
+                    confidence_steps=confidence_steps,
+                    scale_steps=scale_steps,
+                )
+                if scaled_coords is not None:
+                    click_x, click_y = scaled_coords
+                    self._emit_log(f"play_button.png matched via multiscale scan ({region_label}).")
+                    if self._click_play_button_at(click_x, click_y, "multiscale template scan"):
+                        return True
+
+                blue_coords = self._locate_blue_play_button_center(region=region)
+                if blue_coords is not None:
+                    click_x, click_y = blue_coords
+                    if self._click_play_button_at(click_x, click_y, "blue-button fallback"):
+                        return True
+
+            if attempt in (1, 5, 10):
+                self._emit_log(
+                    "play_button.png not matched yet; retrying... "
+                    f"(attempt={attempt}, elapsed={elapsed:.1f}s)"
+                )
+            if not self._sleep_interruptible(0.35):
+                return False
+
+        self._emit_log("play_button.png not found on screen after robust scan.")
+        return False
 
     def _run(self) -> None:
         success = False
