@@ -133,6 +133,65 @@ class GameBot:
         if self.on_finished:
             self.on_finished(success, reason)
 
+    def _log_resource_integrity(self) -> None:
+        meipass = getattr(sys, "_MEIPASS", None)
+        packaged_mode = bool(meipass)
+        base_path = self._resource_dir
+
+        try:
+            base_exists = base_path.exists()
+            base_is_dir = base_path.is_dir()
+        except Exception:
+            base_exists = False
+            base_is_dir = False
+
+        self._emit_log(
+            "Resource check: "
+            f"base={base_path}, packaged_mode={packaged_mode}, "
+            f"exists={base_exists}, is_dir={base_is_dir}."
+        )
+
+        png_names: list[str] = []
+        if base_exists and base_is_dir:
+            try:
+                png_names = sorted(p.name for p in base_path.glob("*.png") if p.is_file())
+            except Exception:
+                png_names = []
+        self._emit_log(f"Resource check: discovered {len(png_names)} PNG file(s) in base path.")
+
+        required_templates = (
+            "play_button.png",
+            "index.png",
+            "index2.png",
+            "inventory.png",
+            "shuffle.png",
+            "ashgor_health.png",
+            "red_ashgor.png",
+            "radius.png",
+            "start_auto.png",
+        )
+        status_parts: list[str] = []
+        missing_templates: list[str] = []
+        for template_name in required_templates:
+            template_path = base_path / template_name
+            exists = template_path.exists()
+            if exists:
+                try:
+                    size_bytes = template_path.stat().st_size
+                    status_parts.append(f"{template_name}=OK({size_bytes}B)")
+                except Exception:
+                    status_parts.append(f"{template_name}=OK")
+            else:
+                status_parts.append(f"{template_name}=MISSING")
+                missing_templates.append(template_name)
+
+        self._emit_log("Resource check: " + ", ".join(status_parts))
+        if missing_templates:
+            self._emit_log(
+                "Resource check warning: missing templates detected: "
+                + ", ".join(missing_templates)
+            )
+
     def _configure_runtime_timing(self) -> None:
         if pyautogui is None or self._runtime_timing_tuned:
             return
@@ -817,7 +876,12 @@ class GameBot:
             except Exception as exc:
                 self._emit_log(f"Failed debug hover at ({cx}, {cy}): {exc}")
 
-    def _locate_blue_play_button_center(self, region):
+    def _locate_blue_play_button_center(
+        self,
+        region,
+        template_path: Optional[Path] = None,
+        min_template_similarity: float = 0.44,
+    ):
         # Last-resort heuristic for Roblox Play: a wide saturated blue button with small white content.
         if pyautogui is None or cv2 is None or np is None:
             return None
@@ -852,6 +916,14 @@ class GameBot:
         if frame_rgb.size == 0:
             return None
 
+        template_gray = None
+        if template_path is not None and template_path.exists() and Image is not None:
+            try:
+                with Image.open(template_path) as template_src:
+                    template_gray = np.array(template_src.convert("L"))
+            except Exception:
+                template_gray = None
+
         try:
             frame_hsv = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
             blue_mask = cv2.inRange(frame_hsv, (90, 70, 70), (135, 255, 255))
@@ -866,7 +938,7 @@ class GameBot:
         if not contours:
             return None
 
-        best: Optional[tuple[float, float, float, int, int, float, float]] = None
+        best: Optional[tuple[float, float, float, int, int, float, float, float]] = None
         center_x_hay = hay_w / 2.0
         center_y_hay = hay_h / 2.0
 
@@ -876,11 +948,11 @@ class GameBot:
                 continue
 
             x, y, w, h = cv2.boundingRect(contour)
-            if w < 80 or h < 24 or h > 180:
+            if w < 140 or h < 24 or h > 170:
                 continue
 
             ratio = w / max(float(h), 1.0)
-            if ratio < 2.0 or ratio > 10.0:
+            if ratio < 2.0 or ratio > 8.5:
                 continue
 
             fill_ratio = area / max(float(w * h), 1.0)
@@ -896,33 +968,54 @@ class GameBot:
             if white_ratio < 0.01 or white_ratio > 0.60:
                 continue
 
+            template_similarity = 0.0
+            if template_gray is not None and template_gray.size > 0:
+                try:
+                    interpolation = cv2.INTER_AREA
+                    if w > template_gray.shape[1] or h > template_gray.shape[0]:
+                        interpolation = cv2.INTER_CUBIC
+                    resized_template = cv2.resize(template_gray, (w, h), interpolation=interpolation)
+                    roi_gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+                    sim_map = cv2.matchTemplate(
+                        roi_gray,
+                        resized_template,
+                        cv2.TM_CCOEFF_NORMED,
+                    )
+                    template_similarity = float(sim_map.max()) if sim_map.size else -1.0
+                except Exception:
+                    template_similarity = -1.0
+                if template_similarity < min_template_similarity:
+                    continue
+
             cx = float(x) + (float(w) / 2.0)
             cy = float(y) + (float(h) / 2.0)
             center_distance = abs(cx - center_x_hay) + abs(cy - center_y_hay)
-            score = area - (center_distance * 1.8)
+            score = area - (center_distance * 1.8) + (template_similarity * 40_000.0)
 
             if best is None or score > best[0]:
-                best = (score, cx, cy, w, h, white_ratio, area)
+                best = (score, cx, cy, w, h, white_ratio, area, template_similarity)
 
         if best is None:
             return None
 
-        _, cx, cy, w, h, white_ratio, area = best
+        _, cx, cy, w, h, white_ratio, area, template_similarity = best
         center_region_x = int(cx / max(scale_x, 1e-9))
         center_region_y = int(cy / max(scale_y, 1e-9))
         click_x = rx + center_region_x
         click_y = ry + center_region_y
         self._emit_log(
             "Blue-play fallback candidate: "
-            f"pos=({click_x}, {click_y}), size={w}x{h}, area={area:.0f}, white_ratio={white_ratio:.3f}."
+            f"pos=({click_x}, {click_y}), size={w}x{h}, area={area:.0f}, "
+            f"white_ratio={white_ratio:.3f}, template_similarity={template_similarity:.3f}."
         )
         return click_x, click_y
 
-    def _click_play_button_at(self, click_x: int, click_y: int, source: str) -> bool:
+    def _click_play_button_at(self, click_x: int, click_y: int, source: str, cache: bool = True) -> bool:
         click_x = int(click_x)
         click_y = int(click_y)
         if self.settings.dry_run:
-            self._click_point_cache["play_button.png"] = (click_x, click_y)
+            if cache:
+                self._click_point_cache["play_button.png"] = (click_x, click_y)
             self._emit_log(
                 f"Dry-run: would click play button at ({click_x}, {click_y}) using {source}."
             )
@@ -930,8 +1023,9 @@ class GameBot:
 
         try:
             pyautogui.click(click_x, click_y)
-            self._click_point_cache["play_button.png"] = (click_x, click_y)
-            self._emit_log(f"Cached click position for play_button.png at ({click_x}, {click_y}).")
+            if cache:
+                self._click_point_cache["play_button.png"] = (click_x, click_y)
+                self._emit_log(f"Cached click position for play_button.png at ({click_x}, {click_y}).")
             self._emit_log(f"Clicked play button at ({click_x}, {click_y}) using {source}.")
             return True
         except Exception as exc:
@@ -1317,14 +1411,22 @@ class GameBot:
             self._emit_log(f"Template not found: {template_path}")
             return False
 
-        base_region = self._get_play_style_region()
-        timeout_seconds = 12.0
-        confidence_steps = [0.92, 0.9, 0.88, 0.85, 0.82, 0.78]
-        scale_steps = [1.0, 0.95, 1.05, 0.9, 1.1, 0.85, 1.15, 0.8, 1.25, 0.75, 1.35]
+        timeout_seconds = 14.0
+        confidence_steps = [0.92, 0.9, 0.88, 0.85, 0.82, 0.78, 0.74, 0.7]
+        scale_steps = [1.0, 0.95, 1.05, 0.9, 1.1, 0.85, 1.15, 0.8, 1.25, 0.75, 1.35, 1.5]
+
+        search_targets: list[tuple[str, Optional[tuple[int, int, int, int]]]] = []
+        roblox_region = self._get_roblox_region()
+        if roblox_region is not None:
+            search_targets.append(("Roblox window", roblox_region))
+        google_region = self._get_google_region()
+        if google_region is not None and google_region != roblox_region:
+            search_targets.append(("Google Chrome window", google_region))
+        search_targets.append(("full screen", None))
 
         self._emit_log(
             f"Looking for {template_path.name} with robust scan (up to {timeout_seconds:.1f}s)..."
-            + (f" (region={base_region})" if base_region else " (full screen)")
+            + (" targets: " + ", ".join(label for label, _ in search_targets))
         )
 
         started_at = time.perf_counter()
@@ -1335,12 +1437,8 @@ class GameBot:
                 break
 
             attempt += 1
-            search_regions = [base_region]
-            if base_region is not None and attempt >= 3:
-                search_regions.append(None)
 
-            for region in search_regions:
-                region_label = f"region={region}" if region is not None else "full screen"
+            for region_label, region in search_targets:
 
                 for grayscale_first in (True, False):
                     for conf in confidence_steps:
@@ -1375,11 +1473,47 @@ class GameBot:
                     if self._click_play_button_at(click_x, click_y, "multiscale template scan"):
                         return True
 
-                blue_coords = self._locate_blue_play_button_center(region=region)
-                if blue_coords is not None:
+                if attempt >= 4:
+                    blue_coords = self._locate_blue_play_button_center(
+                        region=region,
+                        template_path=template_path,
+                        min_template_similarity=0.44,
+                    )
+                    if blue_coords is None:
+                        continue
+
                     click_x, click_y = blue_coords
-                    if self._click_play_button_at(click_x, click_y, "blue-button fallback"):
-                        return True
+                    if not self._click_play_button_at(
+                        click_x,
+                        click_y,
+                        "blue-button fallback",
+                        cache=False,
+                    ):
+                        continue
+
+                    # Fallback guard: if the same blue candidate remains immediately after click,
+                    # treat it as unconfirmed and keep searching.
+                    if not self._sleep_interruptible(1.0):
+                        return False
+                    post_click_blue = self._locate_blue_play_button_center(
+                        region=region,
+                        template_path=template_path,
+                        min_template_similarity=0.44,
+                    )
+                    if post_click_blue is not None:
+                        post_x, post_y = post_click_blue
+                        if abs(post_x - click_x) <= 45 and abs(post_y - click_y) <= 45:
+                            self._emit_log(
+                                "Blue fallback remained visible after click; candidate not confirmed. "
+                                "Continuing scan..."
+                            )
+                            continue
+
+                    self._click_point_cache["play_button.png"] = (click_x, click_y)
+                    self._emit_log(
+                        "Blue fallback changed after click; accepting candidate and continuing load wait."
+                    )
+                    return True
 
             if attempt in (1, 5, 10):
                 self._emit_log(
@@ -1422,6 +1556,7 @@ class GameBot:
             if self.settings.auto_focus:
                 self._emit_log("Auto-focus enabled.")
             self._emit_log("Image detection enabled.")
+            self._log_resource_integrity()
             if self.settings.safety_checks:
                 self._emit_log("Safety checks enabled.")
             if self.settings.runtime_limit_enabled:
